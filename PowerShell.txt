@@ -1,0 +1,39 @@
+cd C:\rutinas_ds\backend
+.venv\Scripts\activate
+uvicorn app.main:app --reload --port 8001
+
+http://127.0.0.1:8001/docs
+
+tree /F /A
+tree /F > tree.txt
+
+cd C:\rutinas_ds\frontend
+npm run dev
+
+http://localhost:3000/login
+
+CLIENTES (sin clave)
+12345678 Juan
+ Pérez
+22334455 María
+ Gómez
+44556677 Lucas 
+Fernández
+99111222 Sofía 
+Martínez
+
+ENTRENADOR
+DNI: 87654321 Carlos 
+Ríos
+Clave: couch123
+
+COORDINADOR
+DNI: 88888888 Laura
+ Benítez
+Clave: coord123
+
+ADMIN
+DNI: 99999999
+Clave: admin123 Administrador 
+Sistema
+

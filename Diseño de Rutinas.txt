@@ -1,0 +1,335 @@
+?? Rutinas Deluxe Sports – Diseño de Rutinas (Referencia Oficial)
+?? Objetivo
+
+Usar Google Sheets como fuente de verdad para las rutinas base y la aplicación como sistema de asignación y seguimiento, garantizando que:
+
+Las rutinas base se puedan modificar y re-sincronizar.
+
+Las rutinas ya asignadas a clientes no se rompan ni se modifiquen.
+
+Cada cliente trabaje siempre con una rutina snapshot propia.
+
+Los roles y permisos se respeten estrictamente.
+
+?? Concepto clave (no negociable)
+?? Dos mundos separados
+1?? Rutinas base (CATÁLOGO)
+
+Viven en Google Sheets
+
+Son editables
+
+Se pueden re-sincronizar
+
+Nunca se asignan directamente al cliente
+
+Ejemplos:
+
+RB001 – Base Fuerza Fullbody
+
+RB002 – Base Hipertrofia Torso/Pierna
+
+RB003 – Base Calistenia Técnica
+
+2?? Rutinas asignadas (SNAPSHOT)
+
+Viven en la base de datos
+
+Son una copia de una rutina base en el momento de la asignación
+
+Se pueden editar para un cliente puntual
+
+Nunca se modifican cuando cambia la rutina base
+
+?? Roles y responsabilidades
+?? CLIENTE
+
+Ve su rutina activa (snapshot)
+
+Marca rutina como realizada
+
+Ve progreso y mediciones
+
+??? ENTRENADOR
+
+Busca clientes por DNI
+
+Asigna rutinas base a clientes (genera snapshot)
+
+Edita la rutina snapshot del cliente
+
+Carga mediciones
+
+????? COORDINADOR / ADMINISTRADOR
+
+Todo lo anterior +
+
+Sincroniza Google Sheets
+
+Mantiene el catálogo de rutinas base
+
+Gestiona entrenadores
+
+Auditoría
+?? Solo COORD / ADMIN pueden sincronizar Sheets.
+
+?? Google Sheets (fuente de verdad)
+Hoja: RUTINAS_BASE
+
+Define el contenido estructural de cada rutina base.
+
+Campos relevantes:
+
+ID Rutina (ej: RB001)
+
+Nombre Rutina
+
+Tipo sesión
+
+Día / Entrenamiento
+
+Categoría
+
+Ejercicio
+
+Orden
+
+Series
+
+Reps
+
+Descanso_seg
+
+Peso_base_kg
+
+Observaciones
+
+Hoja: DICCIONARIO_EJERCICIOS
+
+Define el catálogo único de ejercicios.
+
+Campos:
+
+grupo_muscular
+
+subgrupo
+
+ejercicio
+
+patron
+
+implemento
+
+Esta hoja alimenta el diccionario interno de ejercicios de la app.
+
+??? Modelo de datos (conceptual)
+?? Catálogo (sincronizado desde Sheets)
+exercise_dictionary
+
+Diccionario único de ejercicios.
+
+id
+
+exercise_key (normalizado, único)
+
+grupo
+
+subgrupo
+
+patron
+
+implemento
+
+aliases (opcional)
+
+base_routines
+
+Rutinas base (cabecera).
+
+id
+
+sheet_routine_id (RB001, RB002, …)
+
+name
+
+version
+
+active
+
+synced_at
+
+base_routine_items
+
+Detalle por día/ejercicio de la rutina base.
+
+id
+
+base_routine_id
+
+day_index
+
+order_index
+
+category
+
+exercise_key
+
+sets
+
+reps
+
+rest_seconds
+
+weight_base_kg
+
+notes
+
+?? Asignaciones (snapshots)
+routine_plans
+
+Representa la asignación de una rutina a un cliente.
+
+id
+
+client_id
+
+routine_id (snapshot)
+
+base_routine_id
+
+base_routine_version
+
+assigned_by_app_user_id
+
+start_date
+
+status (ACTIVE / ARCHIVED)
+
+Regla: solo una ACTIVE por cliente.
+
+routines
+
+Snapshot de la rutina asignada a un cliente.
+
+id
+
+client_id
+
+status
+
+planned_days_per_week
+
+created_by_app_user_id
+
+created_at
+
+archived_at
+
+(Opcional / futuro)
+
+routine_days
+
+routine_items
+para permitir edición fina del snapshot desde la app.
+
+?? Sincronización de Google Sheets
+Endpoint
+POST /admin/sync/sheets
+
+Qué hace
+
+Lee DICCIONARIO_EJERCICIOS
+
+Actualiza exercise_dictionary
+
+Lee RUTINAS_BASE
+
+Crea o actualiza base_routines
+
+Crea o actualiza base_routine_items
+
+Si una rutina base cambia:
+
+Se incrementa version
+
+NO se tocan snapshots existentes
+
+
+
+
+
+?? MODELO DE RUTINAS – DELUXE SPORTS
+1?? Catálogo (sin clientes)
+
+exercise_dictionary
+
+lista única de ejercicios
+
+viene de Google Sheets (DICCIONARIO_EJERCICIOS)
+
+base_routines
+
+rutinas base (ej: RB001 – Fuerza Fullbody)
+
+versionadas
+
+vienen de Google Sheets (RUTINAS_BASE)
+
+base_routine_items
+
+ejercicios por día / orden / series / reps
+
+ligados a base_routines
+
+?? Estas tablas se pueden resincronizar
+?? Nunca se modifican por clientes
+
+2?? Asignación a clientes
+
+routine_plans
+
+representa que un cliente tiene asignada una rutina base
+
+guarda:
+
+client_id
+
+base_routine_id
+
+base_routine_version
+
+status (ACTIVE / INACTIVE)
+
+start_date
+
+?? Regla:
+
+un cliente puede tener muchas
+
+solo una ACTIVE
+
+3?? Snapshot editable
+
+routines
+
+copia congelada de la rutina base
+
+se genera al asignar
+
+el profe puede editarla sin romper la base
+
+se referencia desde routine_plans.routine_id
+
+4?? Estado semanal
+
+client_plan_state
+
+no define la rutina
+
+solo guarda progreso:
+
+día actual
+
+semana
+
+adherencia
