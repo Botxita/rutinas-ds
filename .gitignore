@@ -14,8 +14,10 @@ yarn-error.log*
 # Env
 backend/.env
 frontend/.env.local
+backend/venv/
 
 # OS / editor
 .DS_Store
 Thumbs.db
 .vscode/
+
