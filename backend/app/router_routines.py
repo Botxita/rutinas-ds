@@ -7,9 +7,14 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.db import models
 from app.auth.deps import get_current_user
+from app.core.plan_service import assign_base_routine_to_client
 
 router = APIRouter(prefix="/routines", tags=["routines"])
 
+
+# =============================================================================
+# Helpers de rol (sin cambios)
+# =============================================================================
 
 def _role_to_str(role) -> str:
     return role.value if hasattr(role, "value") else str(role)
@@ -40,6 +45,10 @@ def _require_role(current_user: models.User, allowed: set[str]) -> str:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Permisos insuficientes")
     return role_norm
 
+
+# =============================================================================
+# Schemas (sin cambios)
+# =============================================================================
 
 class AssignRoutineRequest(BaseModel):
     client_dni: str = Field(..., min_length=7, max_length=9)
@@ -93,6 +102,10 @@ class ClientRoutineResponse(BaseModel):
     items: list[ClientRoutineItemResponse]
 
 
+# =============================================================================
+# Endpoints
+# =============================================================================
+
 @router.get("/base", response_model=list[BaseRoutineResponse])
 def list_base_routines(
     db: Session = Depends(get_db),
@@ -116,80 +129,48 @@ def list_base_routines(
 
 
 @router.post("/assign", response_model=AssignRoutineResponse, status_code=status.HTTP_201_CREATED)
-def assign_base_routine_to_client(
+def assign_routine_endpoint(
     data: AssignRoutineRequest,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
+    """
+    Asigna una rutina base a un cliente.
+
+    - Solo ENTRENADOR / COORDINADOR / ADMINISTRADOR.
+    - La lógica de negocio vive en plan_service.assign_base_routine_to_client().
+    - El router solo resuelve: auth, lookup de cliente por DNI, traducción de errores HTTP.
+    """
     _require_role(current_user, {"ENTRENADOR", "COORDINADOR", "ADMINISTRADOR"})
 
+    # Resolver cliente por DNI (responsabilidad del router: HTTP → domain)
     client = db.query(models.User).filter(models.User.dni == data.client_dni).first()
     if not client:
         raise HTTPException(status_code=404, detail="Cliente no encontrado")
     if _normalize_role(client.role) != "CLIENTE":
         raise HTTPException(status_code=400, detail="El DNI no corresponde a un CLIENTE")
 
-    base = (
-        db.query(models.BaseRoutine)
-        .filter(models.BaseRoutine.sheet_routine_id == data.sheet_routine_id)
-        .first()
-    )
-    if not base:
-        raise HTTPException(status_code=404, detail="Rutina base no encontrada")
-
-    base_items = (
-        db.query(models.BaseRoutineItem)
-        .filter(models.BaseRoutineItem.base_routine_id == base.id)
-        .order_by(models.BaseRoutineItem.day_index.asc(), models.BaseRoutineItem.order_index.asc())
-        .all()
-    )
-    if not base_items:
-        raise HTTPException(status_code=400, detail="La rutina base no tiene items (vacía)")
-
+    # Delegar toda la lógica de negocio al service
     try:
-        # 1) Desactivar rutinas previas
-        db.query(models.ClientRoutine).filter(
-            models.ClientRoutine.client_id == client.id,
-            models.ClientRoutine.active.is_(True),
-        ).update({"active": False})
-
-        # 2) Crear cabecera nueva
-        cr = models.ClientRoutine(client_id=client.id, base_routine_id=base.id, active=True)
-        db.add(cr)
-        db.flush()
-
-        # 3) Copiar items
-        copied = 0
-        for it in base_items:
-            db.add(
-                models.ClientRoutineItem(
-                    client_routine_id=cr.id,
-                    day_index=it.day_index,
-                    order_index=it.order_index,
-                    category=it.category,
-                    exercise_key=it.exercise_key,
-                    sets=it.sets,
-                    reps=it.reps,
-                    rest_seconds=it.rest_seconds,
-                    weight_base_kg=it.weight_base_kg,
-                    notes=it.notes,
-                )
-            )
-            copied += 1
-
-        db.commit()
-
-        return AssignRoutineResponse(
-            client_routine_id=str(cr.id),
-            client_id=str(client.id),
-            base_routine_id=str(base.id),
-            sheet_routine_id=base.sheet_routine_id,
-            copied_items=copied,
+        result = assign_base_routine_to_client(
+            db=db,
+            client_id=client.id,
+            sheet_routine_id=data.sheet_routine_id,
         )
-
+    except ValueError as e:
+        # Errores de negocio conocidos (rutina no encontrada, sin items, etc.)
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        db.rollback()
+        # Error inesperado de DB u otro
         raise HTTPException(status_code=500, detail=f"Error asignando rutina: {e}")
+
+    return AssignRoutineResponse(
+        client_routine_id=str(result.client_routine_id),
+        client_id=str(result.client_id),
+        base_routine_id=str(result.base_routine_id),
+        sheet_routine_id=result.sheet_routine_id,
+        copied_items=result.copied_items,
+    )
 
 
 @router.get("/client/{dni}", response_model=ClientRoutineResponse)
