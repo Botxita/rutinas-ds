@@ -1,97 +1,92 @@
 from datetime import date
 from uuid import UUID
 
-from sqlalchemy.orm import Session
 from sqlalchemy import desc
+from sqlalchemy.orm import Session
 
-from app.core.date_utils import week_monday
 from app.db.models import (
     BaseRoutine,
     BaseRoutineItem,
-    ClientPlanConfigHistory,
     ClientPlanState,
     ClientRoutine,
     ClientRoutineItem,
 )
 
-DEFAULT_BASE_DAYS = 3  # fallback si no hay config para el cliente
-
 
 # =============================================================================
-# Helpers internos de estado semanal
+# State management
 # =============================================================================
 
-def get_effective_base_days(db: Session, client_id, day: date) -> int:
-    row = (
-        db.query(ClientPlanConfigHistory)
-        .filter(
-            ClientPlanConfigHistory.client_id == client_id,
-            ClientPlanConfigHistory.effective_from_date <= day,
-        )
-        .order_by(desc(ClientPlanConfigHistory.effective_from_date))
-        .first()
-    )
-    return row.base_days_per_week if row else DEFAULT_BASE_DAYS
-
-
-def get_or_init_state(db: Session, client_id, day: date) -> ClientPlanState:
-    monday = week_monday(day)
+def get_or_init_state(db: Session, client_id) -> ClientPlanState:
+    """Ensures a ClientPlanState row exists for the client. Defaults next_base_day_index to 1."""
     st = db.query(ClientPlanState).filter(ClientPlanState.client_id == client_id).first()
-
     if not st:
         st = ClientPlanState(
             client_id=client_id,
             next_base_day_index=1,
-            week_start_date=monday,
-            bases_done_this_week=0,
+            week_start_date=date.today(),  # schema requires NOT NULL; not used for logic
         )
         db.add(st)
         db.flush()
-        return st
-
-    # reset semanal
-    if st.week_start_date != monday:
-        st.week_start_date = monday
-        st.bases_done_this_week = 0
-        if st.next_base_day_index is None:
-            st.next_base_day_index = 1
-
     return st
 
 
-def _normalize_next_day(next_day: int, n: int) -> int:
-    if not next_day or next_day < 1 or next_day > n:
-        return 1
+def _get_total_routine_days(db: Session, client_id) -> int:
+    """Returns max(day_index) from the active ClientRoutine snapshot."""
+    cr = (
+        db.query(ClientRoutine)
+        .filter(ClientRoutine.client_id == client_id, ClientRoutine.active.is_(True))
+        .first()
+    )
+    if not cr:
+        raise ValueError("El cliente no tiene una rutina activa asignada")
+
+    top_item = (
+        db.query(ClientRoutineItem)
+        .filter(ClientRoutineItem.client_routine_id == cr.id)
+        .order_by(desc(ClientRoutineItem.day_index))
+        .first()
+    )
+    if not top_item:
+        raise ValueError("La rutina activa no tiene ejercicios")
+
+    return top_item.day_index
+
+
+# =============================================================================
+# Public API
+# =============================================================================
+
+def get_current_training_day(db: Session, client_id) -> int:
+    """Returns the current training day index for the client."""
+    st = get_or_init_state(db, client_id)
+    return st.next_base_day_index
+
+
+def complete_training(db: Session, client_id) -> int:
+    """
+    Advances the client to the next training day.
+    Wraps back to 1 after the last day of the routine.
+    Returns the new next_base_day_index.
+    """
+    total = _get_total_routine_days(db, client_id)
+    st = get_or_init_state(db, client_id)
+
+    next_day = st.next_base_day_index + 1
+    if next_day > total:
+        next_day = 1
+
+    st.next_base_day_index = next_day
+    db.commit()
     return next_day
 
 
-def get_today_kind(db: Session, client_id, day: date) -> dict:
-    n = get_effective_base_days(db, client_id, day)
-    st = get_or_init_state(db, client_id, day)
-
-    st.next_base_day_index = _normalize_next_day(st.next_base_day_index, n)
-    kind = "BASE" if st.bases_done_this_week < n else "EXTRA"
-
-    return {
-        "kind": kind,
-        "n": n,
-        "next_base_day_index": st.next_base_day_index,
-        "bases_done_this_week": st.bases_done_this_week,
-        "week_start_date": st.week_start_date,
-    }
-
-
-def ensure_state_row(db: Session, client_id, day: date) -> ClientPlanState:
-    """Garantiza que exista el estado del cliente (ClientPlanState) y aplica reset semanal si corresponde."""
-    return get_or_init_state(db, client_id, day)
-
-
 # =============================================================================
-# Asignación de rutina base a cliente
+# Assign routine
 # =============================================================================
 
 class AssignRoutineResult:
-    """Resultado de assign_base_routine_to_client. Usado por el router para armar la response."""
+    """Result of assign_base_routine_to_client. Used by the router to build the response."""
 
     def __init__(
         self,
@@ -114,26 +109,18 @@ def assign_base_routine_to_client(
     sheet_routine_id: str,
 ) -> AssignRoutineResult:
     """
-    Asigna una rutina base a un cliente creando un snapshot físico completo.
+    Assigns a base routine to a client by creating a full physical snapshot.
 
-    Contrato:
-    - Busca BaseRoutine por sheet_routine_id con active=True.
-    - Desactiva cualquier ClientRoutine ACTIVE previa del cliente.
-    - Crea nuevo ClientRoutine (snapshot cabecera) con active=True.
-    - Copia físicamente todos los BaseRoutineItem a ClientRoutineItem.
-    - Crea o reinicializa ClientPlanState:
-        next_base_day_index = 1
-        bases_done_this_week = 0
-        week_start_date = date.today()  (NOT NULL en el modelo; se resetea al asignar)
-    - Commit único al final. Rollback ante cualquier excepción.
+    - Looks up BaseRoutine by sheet_routine_id where active=True.
+    - Deactivates any existing active ClientRoutine for the client.
+    - Creates a new ClientRoutine (snapshot header) with active=True.
+    - Copies all BaseRoutineItem rows to ClientRoutineItem.
+    - Resets ClientPlanState with next_base_day_index = 1.
+    - Single commit at the end; rollback on any exception.
 
     Raises:
-        ValueError: si la rutina base no existe, no está activa o no tiene items.
-        RuntimeError: ante errores de DB inesperados.
+        ValueError: if the base routine doesn't exist, isn't active, or has no items.
     """
-    # ------------------------------------------------------------------
-    # 1. Buscar rutina base activa
-    # ------------------------------------------------------------------
     base: BaseRoutine | None = (
         db.query(BaseRoutine)
         .filter(
@@ -145,9 +132,6 @@ def assign_base_routine_to_client(
     if not base:
         raise ValueError(f"Rutina base '{sheet_routine_id}' no encontrada o no está activa")
 
-    # ------------------------------------------------------------------
-    # 2. Verificar que tiene items
-    # ------------------------------------------------------------------
     base_items: list[BaseRoutineItem] = (
         db.query(BaseRoutineItem)
         .filter(BaseRoutineItem.base_routine_id == base.id)
@@ -157,26 +141,23 @@ def assign_base_routine_to_client(
     if not base_items:
         raise ValueError(f"La rutina base '{sheet_routine_id}' no tiene items (está vacía)")
 
-    # ------------------------------------------------------------------
-    # Transacción
-    # ------------------------------------------------------------------
     try:
-        # 3. Desactivar ClientRoutines ACTIVE previas del cliente
+        # Deactivate previous active routines
         db.query(ClientRoutine).filter(
             ClientRoutine.client_id == client_id,
             ClientRoutine.active.is_(True),
         ).update({"active": False}, synchronize_session=False)
 
-        # 4. Crear snapshot cabecera
+        # Create snapshot header
         cr = ClientRoutine(
             client_id=client_id,
             base_routine_id=base.id,
             active=True,
         )
         db.add(cr)
-        db.flush()  # necesario para obtener cr.id antes de insertar items
+        db.flush()
 
-        # 5. Copiar items físicamente (snapshot independiente del catálogo)
+        # Copy items as independent snapshot
         for it in base_items:
             db.add(
                 ClientRoutineItem(
@@ -193,31 +174,23 @@ def assign_base_routine_to_client(
                 )
             )
 
-        # 6. Crear o reinicializar ClientPlanState
-        #    Nota: week_start_date es NOT NULL en el modelo, por lo que se usa
-        #    date.today() como valor de reset en lugar de None.
-        today = date.today()
+        # Reset or create ClientPlanState
         st: ClientPlanState | None = (
             db.query(ClientPlanState)
             .filter(ClientPlanState.client_id == client_id)
             .first()
         )
         if st:
-            # Reinicializar: nueva rutina = empezar desde el día 1
             st.next_base_day_index = 1
-            st.bases_done_this_week = 0
-            st.week_start_date = today
         else:
             db.add(
                 ClientPlanState(
                     client_id=client_id,
                     next_base_day_index=1,
-                    bases_done_this_week=0,
-                    week_start_date=today,
+                    week_start_date=date.today(),  # schema requires NOT NULL; not used for logic
                 )
             )
 
-        # 7. Commit único
         db.commit()
 
         return AssignRoutineResult(
