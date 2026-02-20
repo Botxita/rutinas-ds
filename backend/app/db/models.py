@@ -256,3 +256,38 @@ class ClientRoutineItem(Base):
 
     # Recomendado agregar constraint único en DB:
     # Unique(client_routine_id, day_index, order_index)
+
+# -------------------------
+# CLIENT TRAINING LOG (DB: public.client_training_log)
+# Historial real de ejecuciones
+# -------------------------
+class ClientTrainingLog(Base):
+    __tablename__ = "client_training_log"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    client_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("app_users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    client_routine_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("client_routines.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    day_index = Column(Integer, nullable=False)
+
+    completed_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    recorded_by = Column(
+        UUID(as_uuid=True),
+        ForeignKey("app_users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
