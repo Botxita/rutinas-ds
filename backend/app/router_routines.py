@@ -298,52 +298,85 @@ def complete_training(
     if _normalize_role(client.role) != "CLIENTE":
         raise HTTPException(status_code=400, detail="El DNI no corresponde a un CLIENTE")
 
-    client_routine = (
-        db.query(models.ClientRoutine)
-        .filter(models.ClientRoutine.client_id == client.id, models.ClientRoutine.active.is_(True))
-        .first()
-    )
-    if not client_routine:
-        raise HTTPException(status_code=404, detail="No tiene rutina activa")
-
-    plan_state = (
-        db.query(models.ClientPlanState)
-        .filter(models.ClientPlanState.client_id == client.id)
-        .first()
-    )
-    if not plan_state:
-        raise HTTPException(status_code=404, detail="No tiene estado de plan")
-
     today = date.today()
 
-    # Reset semanal real por "inicio de semana" (lunes)
-    if _week_start(plan_state.week_start_date) != _week_start(today):
-        plan_state.bases_done_this_week = 0
-        plan_state.week_start_date = today  # mantenemos tu campo como "fecha de referencia"
+    try:
+        # Rutina activa
+        client_routine = (
+            db.query(models.ClientRoutine)
+            .filter(
+                models.ClientRoutine.client_id == client.id,
+                models.ClientRoutine.active.is_(True),
+            )
+            .first()
+        )
+        if not client_routine:
+            raise HTTPException(status_code=404, detail="No tiene rutina activa")
 
-    day_to_complete = int(plan_state.next_base_day_index)
+        # 🔒 Lock fila
+        plan_state = (
+            db.query(models.ClientPlanState)
+            .filter(models.ClientPlanState.client_id == client.id)
+            .with_for_update()
+            .first()
+        )
+        if not plan_state:
+            raise HTTPException(status_code=404, detail="No tiene estado de plan")
 
-    log = models.ClientTrainingLog(
-        client_id=client.id,
-        client_routine_id=client_routine.id,
-        day_index=day_to_complete,
-        recorded_by=current_user.id,
-    )
-    db.add(log)
+        # Reset semanal
+        if _week_start(plan_state.week_start_date) != _week_start(today):
+            plan_state.bases_done_this_week = 0
+            plan_state.week_start_date = today
 
-    # Max day en el snapshot asignado
-    max_day = (
-        db.query(func.max(models.ClientRoutineItem.day_index))
-        .filter(models.ClientRoutineItem.client_routine_id == client_routine.id)
-        .scalar()
-    )
-    max_day = int(max_day or 1)
+        day_to_complete = int(plan_state.next_base_day_index)
 
-    plan_state.next_base_day_index = 1 if day_to_complete >= max_day else (day_to_complete + 1)
-    plan_state.bases_done_this_week = int(plan_state.bases_done_this_week or 0) + 1
-    plan_state.updated_at = func.now()
+        # 🚫 evitar doble registro hoy
+        existing_today = (
+            db.query(models.ClientTrainingLog)
+            .filter(models.ClientTrainingLog.client_id == client.id)
+            .filter(models.ClientTrainingLog.day_index == day_to_complete)
+            .filter(func.date(models.ClientTrainingLog.completed_at) == today)
+            .first()
+        )
 
-    db.commit()
+        if existing_today:
+            raise HTTPException(status_code=400, detail="Entrenamiento ya registrado hoy")
+
+        # Insert log
+        log = models.ClientTrainingLog(
+            client_id=client.id,
+            client_routine_id=client_routine.id,
+            day_index=day_to_complete,
+            completed_date=today,  # 👈 obligatorio ahora
+            recorded_by=current_user.id,
+        )
+        db.add(log)
+
+        # Max day
+        max_day = (
+            db.query(func.max(models.ClientRoutineItem.day_index))
+            .filter(models.ClientRoutineItem.client_routine_id == client_routine.id)
+            .scalar()
+        )
+        max_day = int(max_day or 1)
+
+        # Avance cíclico
+        plan_state.next_base_day_index = (
+            1 if day_to_complete >= max_day else day_to_complete + 1
+        )
+
+        plan_state.bases_done_this_week = int(plan_state.bases_done_this_week or 0) + 1
+        plan_state.updated_at = func.now()
+
+        db.flush()   # importante para que el lock se mantenga consistente
+        db.commit()
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error registrando entrenamiento: {e}")
 
     return {
         "completed_day": day_to_complete,

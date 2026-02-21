@@ -261,6 +261,10 @@ class ClientRoutineItem(Base):
 # CLIENT TRAINING LOG (DB: public.client_training_log)
 # Historial real de ejecuciones
 # -------------------------
+# -------------------------
+# CLIENT TRAINING LOG (DB: public.client_training_log)
+# Historial real de ejecuciones
+# -------------------------
 class ClientTrainingLog(Base):
     __tablename__ = "client_training_log"
 
@@ -286,8 +290,23 @@ class ClientTrainingLog(Base):
         nullable=False,
     )
 
+    # Fecha calendario para constraint único
+    completed_date = Column(
+        Date,
+        nullable=False,
+    )
+
     recorded_by = Column(
         UUID(as_uuid=True),
         ForeignKey("app_users.id", ondelete="SET NULL"),
         nullable=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id",
+            "day_index",
+            "completed_date",
+            name="unique_client_day_per_date",
+        ),
     )
