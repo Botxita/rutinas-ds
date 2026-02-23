@@ -513,3 +513,177 @@ def get_training_metrics(
         "average_per_week": average_per_week,
         "cycle_frequency": int(frequency),
     }
+
+class UpdateRoutineItemRequest(BaseModel):
+    sets: str | None = None
+    reps: str | None = None
+    weight_base_kg: float | None = None
+    rest_seconds: int | None = None
+    notes: str | None = None
+
+
+@router.patch("/client/{dni}/items/{item_id}")
+def update_routine_item(
+    dni: str,
+    item_id: str,
+    data: UpdateRoutineItemRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Edita un ítem del snapshot de rutina de un cliente.
+    Solo ENTRENADOR / COORDINADOR / ADMINISTRADOR.
+    El ítem debe pertenecer a la rutina activa del cliente.
+    """
+    _require_role(current_user, {"ENTRENADOR", "COORDINADOR", "ADMINISTRADOR"})
+
+    # Verificar que el cliente existe
+    client = db.query(models.User).filter(models.User.dni == dni).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+
+    # Verificar que tiene rutina activa
+    active_routine = (
+        db.query(models.ClientRoutine)
+        .filter(
+            models.ClientRoutine.client_id == client.id,
+            models.ClientRoutine.active.is_(True),
+        )
+        .first()
+    )
+    if not active_routine:
+        raise HTTPException(status_code=404, detail="El cliente no tiene rutina activa")
+
+    # Buscar el item verificando que pertenece a ESA rutina (seguridad)
+    try:
+        item_uuid = __import__("uuid").UUID(item_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="item_id inválido")
+
+    item = (
+        db.query(models.ClientRoutineItem)
+        .filter(
+            models.ClientRoutineItem.id == item_uuid,
+            models.ClientRoutineItem.client_routine_id == active_routine.id,
+        )
+        .first()
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Item no encontrado")
+
+    # Aplicar solo los campos enviados (PATCH semántico)
+    if data.sets is not None:
+        item.sets = data.sets
+    if data.reps is not None:
+        item.reps = data.reps
+    if data.weight_base_kg is not None:
+        item.weight_base_kg = data.weight_base_kg
+    if data.rest_seconds is not None:
+        item.rest_seconds = data.rest_seconds
+    if data.notes is not None:
+        item.notes = data.notes
+
+    db.commit()
+    db.refresh(item)
+
+    return {
+        "item_id": str(item.id),
+        "sets": item.sets,
+        "reps": item.reps,
+        "weight_base_kg": float(item.weight_base_kg) if item.weight_base_kg is not None else None,
+        "rest_seconds": item.rest_seconds,
+        "notes": item.notes,
+    }
+
+# =============================================================================
+# PATCH /routines/client/{dni}/items/{item_id}
+# =============================================================================
+
+class UpdateRoutineItemRequest(BaseModel):
+    sets: str | None = None
+    reps: str | None = None
+    weight_base_kg: float | None = None
+    rest_seconds: int | None = None
+    notes: str | None = None
+
+
+def _get_active_routine_for_client_id(
+    db: Session,
+    client_id,
+) -> models.ClientRoutine | None:
+    """Rutina activa del cliente. Centralizado para futura migración active -> status."""
+    return (
+        db.query(models.ClientRoutine)
+        .filter(
+            models.ClientRoutine.client_id == client_id,
+            models.ClientRoutine.active.is_(True),
+        )
+        .first()
+    )
+
+
+@router.patch("/client/{dni}/items/{item_id}")
+def update_routine_item(
+    dni: str,
+    item_id: str,
+    data: UpdateRoutineItemRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Edita un ítem del snapshot de rutina de un cliente.
+    Solo ENTRENADOR / COORDINADOR / ADMINISTRADOR.
+    Valida: cliente existe → rutina activa → item pertenece a esa rutina.
+    """
+    import uuid as _uuid
+
+    _require_role(current_user, {"ENTRENADOR", "COORDINADOR", "ADMINISTRADOR"})
+
+    client = db.query(models.User).filter(models.User.dni == dni).first()
+    if not client:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cliente no encontrado")
+
+    active_routine = _get_active_routine_for_client_id(db, client.id)
+    if not active_routine:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El cliente no tiene rutina activa")
+
+    try:
+        item_uuid = _uuid.UUID(item_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="item_id inválido")
+
+    item = (
+        db.query(models.ClientRoutineItem)
+        .filter(
+            models.ClientRoutineItem.id == item_uuid,
+            models.ClientRoutineItem.client_routine_id == active_routine.id,
+        )
+        .first()
+    )
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item no encontrado")
+
+    # PATCH semántico: solo actualiza los campos enviados
+    if data.sets is not None:
+        item.sets = data.sets
+    if data.reps is not None:
+        item.reps = data.reps
+    if data.weight_base_kg is not None:
+        item.weight_base_kg = data.weight_base_kg
+    if data.rest_seconds is not None:
+        item.rest_seconds = data.rest_seconds
+    if data.notes is not None:
+        item.notes = data.notes
+
+    db.commit()
+    db.refresh(item)
+
+    return {
+        "item_id": str(item.id),
+        "day_index": item.day_index,
+        "order_index": item.order_index,
+        "exercise_key": item.exercise_key,
+        "sets": item.sets,
+        "reps": item.reps,
+        "weight_base_kg": float(item.weight_base_kg) if item.weight_base_kg is not None else None,
+        "rest_seconds": item.rest_seconds,
+        "notes": item.notes,
+    }
