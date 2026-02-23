@@ -103,58 +103,6 @@ class ClientPlanConfigHistory(Base):
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-
-# -------------------------
-# ROUTINE PLANS (DB: public.routine_plans)
-# -------------------------
-class RoutinePlan(Base):
-    __tablename__ = "routine_plans"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    client_id = Column(UUID(as_uuid=True), ForeignKey("app_users.id", ondelete="CASCADE"), nullable=False)
-
-    frequency = Column(Integer, nullable=False)
-    start_date = Column(Date, nullable=False)
-    status = Column(String, nullable=False, default="ACTIVE")
-
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-    __table_args__ = (
-        CheckConstraint("frequency BETWEEN 2 AND 6", name="ck_routine_plans_frequency_2_6"),
-        CheckConstraint("status IN ('ACTIVE','INACTIVE')", name="ck_routine_plans_status"),
-    )
-
-
-# -------------------------
-# WORKOUT SESSIONS (DB: public.workout_sessions)
-# -------------------------
-class WorkoutSession(Base):
-    __tablename__ = "workout_sessions"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-
-    plan_id = Column(UUID(as_uuid=True), ForeignKey("routine_plans.id", ondelete="CASCADE"), nullable=False)
-
-    session_index = Column(Integer, nullable=False)  # 1..N incremental dentro del plan
-    session_type = Column(String, nullable=False)    # BASE | EXTRA
-    base_day_index = Column(Integer, nullable=True)  # 1..frequency (solo BASE)
-
-    label = Column(String, nullable=True)
-    intensity = Column(String, nullable=False, default="NORMAL")  # LIGERA|NORMAL|FUERTE
-
-    week_start_date = Column(Date, nullable=True)
-
-    recorded_by_user_id = Column(UUID(as_uuid=True), ForeignKey("app_users.id", ondelete="SET NULL"), nullable=True)
-
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-    __table_args__ = (
-        CheckConstraint("session_type IN ('BASE','EXTRA')", name="ck_workout_sessions_type"),
-        CheckConstraint("intensity IN ('LIGERA','NORMAL','FUERTE')", name="ck_workout_sessions_intensity"),
-        CheckConstraint("session_index >= 1", name="ck_workout_sessions_session_index"),
-    )
-
-
 # -------------------------
 # BASE ROUTINES (DB: public.base_routines)
 # Sincronizadas desde Google Sheets
@@ -256,3 +204,57 @@ class ClientRoutineItem(Base):
 
     # Recomendado agregar constraint único en DB:
     # Unique(client_routine_id, day_index, order_index)
+
+# -------------------------
+# CLIENT TRAINING LOG (DB: public.client_training_log)
+# Historial real de ejecuciones
+# -------------------------
+# -------------------------
+# CLIENT TRAINING LOG (DB: public.client_training_log)
+# Historial real de ejecuciones
+# -------------------------
+class ClientTrainingLog(Base):
+    __tablename__ = "client_training_log"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    client_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("app_users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    client_routine_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("client_routines.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    day_index = Column(Integer, nullable=False)
+
+    completed_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    # Fecha calendario para constraint único
+    completed_date = Column(
+        Date,
+        nullable=False,
+    )
+
+    recorded_by = Column(
+        UUID(as_uuid=True),
+        ForeignKey("app_users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id",
+            "day_index",
+            "completed_date",
+            name="unique_client_day_per_date",
+        ),
+    )

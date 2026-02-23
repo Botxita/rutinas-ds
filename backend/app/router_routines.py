@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+from datetime import date
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, validator
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.db.session import get_db
-from app.db import models
 from app.auth.deps import get_current_user
 from app.core.plan_service import assign_base_routine_to_client
+from app.db import models
+from app.db.session import get_db
 
 router = APIRouter(prefix="/routines", tags=["routines"])
 
 
 # =============================================================================
-# Helpers de rol (sin cambios)
+# Helpers de rol
 # =============================================================================
 
 def _role_to_str(role) -> str:
@@ -46,8 +50,22 @@ def _require_role(current_user: models.User, allowed: set[str]) -> str:
     return role_norm
 
 
+def _require_self_or_staff(current_user: models.User, dni: str) -> None:
+    role = _normalize_role(current_user.role)
+    if role == "CLIENTE":
+        if (current_user.dni or "").strip() != (dni or "").strip():
+            raise HTTPException(status_code=403, detail="Permisos insuficientes")
+    else:
+        _require_role(current_user, {"ENTRENADOR", "COORDINADOR", "ADMINISTRADOR"})
+
+
+def _week_start(d: date) -> date:
+    # Lunes como inicio de semana (0=lunes ... 6=domingo)
+    return d.fromordinal(d.toordinal() - d.weekday())
+
+
 # =============================================================================
-# Schemas (sin cambios)
+# Schemas
 # =============================================================================
 
 class AssignRoutineRequest(BaseModel):
@@ -121,7 +139,7 @@ def list_base_routines(
             id=str(r.id),
             sheet_routine_id=r.sheet_routine_id,
             name=r.name,
-            version=r.version,
+            version=int(r.version),
             active=bool(r.active),
         )
         for r in routines
@@ -136,21 +154,16 @@ def assign_routine_endpoint(
 ):
     """
     Asigna una rutina base a un cliente.
-
     - Solo ENTRENADOR / COORDINADOR / ADMINISTRADOR.
-    - La lógica de negocio vive en plan_service.assign_base_routine_to_client().
-    - El router solo resuelve: auth, lookup de cliente por DNI, traducción de errores HTTP.
     """
     _require_role(current_user, {"ENTRENADOR", "COORDINADOR", "ADMINISTRADOR"})
 
-    # Resolver cliente por DNI (responsabilidad del router: HTTP → domain)
     client = db.query(models.User).filter(models.User.dni == data.client_dni).first()
     if not client:
         raise HTTPException(status_code=404, detail="Cliente no encontrado")
     if _normalize_role(client.role) != "CLIENTE":
         raise HTTPException(status_code=400, detail="El DNI no corresponde a un CLIENTE")
 
-    # Delegar toda la lógica de negocio al service
     try:
         result = assign_base_routine_to_client(
             db=db,
@@ -158,10 +171,8 @@ def assign_routine_endpoint(
             sheet_routine_id=data.sheet_routine_id,
         )
     except ValueError as e:
-        # Errores de negocio conocidos (rutina no encontrada, sin items, etc.)
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        # Error inesperado de DB u otro
         raise HTTPException(status_code=500, detail=f"Error asignando rutina: {e}")
 
     return AssignRoutineResponse(
@@ -169,7 +180,7 @@ def assign_routine_endpoint(
         client_id=str(result.client_id),
         base_routine_id=str(result.base_routine_id),
         sheet_routine_id=result.sheet_routine_id,
-        copied_items=result.copied_items,
+        copied_items=int(result.copied_items),
     )
 
 
@@ -271,3 +282,408 @@ def get_my_active_routine(
             for i in items
         ],
     )
+
+
+@router.post("/complete/{dni}")
+def complete_training(
+    dni: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _require_self_or_staff(current_user, dni)
+
+    client = db.query(models.User).filter(models.User.dni == dni).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+    if _normalize_role(client.role) != "CLIENTE":
+        raise HTTPException(status_code=400, detail="El DNI no corresponde a un CLIENTE")
+
+    today = date.today()
+
+    try:
+        # Rutina activa
+        client_routine = (
+            db.query(models.ClientRoutine)
+            .filter(
+                models.ClientRoutine.client_id == client.id,
+                models.ClientRoutine.active.is_(True),
+            )
+            .first()
+        )
+        if not client_routine:
+            raise HTTPException(status_code=404, detail="No tiene rutina activa")
+
+        # 🔒 Lock fila
+        plan_state = (
+            db.query(models.ClientPlanState)
+            .filter(models.ClientPlanState.client_id == client.id)
+            .with_for_update()
+            .first()
+        )
+        if not plan_state:
+            raise HTTPException(status_code=404, detail="No tiene estado de plan")
+
+        # Reset semanal
+        if _week_start(plan_state.week_start_date) != _week_start(today):
+            plan_state.bases_done_this_week = 0
+            plan_state.week_start_date = today
+
+        day_to_complete = int(plan_state.next_base_day_index)
+
+        # 🚫 evitar doble registro hoy
+        existing_today = (
+            db.query(models.ClientTrainingLog)
+            .filter(models.ClientTrainingLog.client_id == client.id)
+            .filter(models.ClientTrainingLog.day_index == day_to_complete)
+            .filter(func.date(models.ClientTrainingLog.completed_at) == today)
+            .first()
+        )
+
+        if existing_today:
+            raise HTTPException(status_code=400, detail="Entrenamiento ya registrado hoy")
+
+        # Insert log
+        log = models.ClientTrainingLog(
+            client_id=client.id,
+            client_routine_id=client_routine.id,
+            day_index=day_to_complete,
+            completed_date=today,  # 👈 obligatorio ahora
+            recorded_by=current_user.id,
+        )
+        db.add(log)
+
+        # Max day
+        max_day = (
+            db.query(func.max(models.ClientRoutineItem.day_index))
+            .filter(models.ClientRoutineItem.client_routine_id == client_routine.id)
+            .scalar()
+        )
+        max_day = int(max_day or 1)
+
+        # Avance cíclico
+        plan_state.next_base_day_index = (
+            1 if day_to_complete >= max_day else day_to_complete + 1
+        )
+
+        plan_state.bases_done_this_week = int(plan_state.bases_done_this_week or 0) + 1
+        plan_state.updated_at = func.now()
+
+        db.flush()   # importante para que el lock se mantenga consistente
+        db.commit()
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error registrando entrenamiento: {e}")
+
+    return {
+        "completed_day": day_to_complete,
+        "next_day": int(plan_state.next_base_day_index),
+        "bases_done_this_week": int(plan_state.bases_done_this_week),
+    }
+
+
+@router.get("/history/{dni}")
+def get_training_history(
+    dni: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _require_self_or_staff(current_user, dni)
+
+    user = db.query(models.User).filter(models.User.dni == dni).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+
+    logs = (
+        db.query(models.ClientTrainingLog)
+        .filter(models.ClientTrainingLog.client_id == user.id)
+        .order_by(models.ClientTrainingLog.completed_at.desc())
+        .all()
+    )
+
+    result: list[dict[str, Any]] = []
+
+    for log in logs:
+        routine = db.query(models.ClientRoutine).filter(models.ClientRoutine.id == log.client_routine_id).first()
+        base = (
+            db.query(models.BaseRoutine).filter(models.BaseRoutine.id == routine.base_routine_id).first()
+            if routine else None
+        )
+
+        result.append({
+            "completed_at": log.completed_at,
+            "day_index": int(log.day_index),
+            "client_routine_id": str(log.client_routine_id),
+            "sheet_routine_id": base.sheet_routine_id if base else None,
+            "routine_name": base.name if base else None,
+            "recorded_by": str(log.recorded_by) if log.recorded_by else None,
+        })
+
+    return result
+
+
+@router.get("/metrics/{dni}")
+def get_training_metrics(
+    dni: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    _require_self_or_staff(current_user, dni)
+
+    user = db.query(models.User).filter(models.User.dni == dni).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+
+    logs = (
+        db.query(models.ClientTrainingLog)
+        .filter(models.ClientTrainingLog.client_id == user.id)
+        .order_by(models.ClientTrainingLog.completed_at.asc())
+        .all()
+    )
+
+    total_trainings = len(logs)
+
+    plan_state = (
+        db.query(models.ClientPlanState)
+        .filter(models.ClientPlanState.client_id == user.id)
+        .first()
+    )
+    trainings_this_week = int(plan_state.bases_done_this_week) if plan_state else 0
+
+    if total_trainings == 0:
+        return {
+            "total_trainings": 0,
+            "trainings_this_week": trainings_this_week,
+            "current_streak": 0,
+            "last_training_date": None,
+            "average_per_week": 0,
+        }
+
+    # ====== FRECUENCIA (N días del ciclo) desde la rutina activa ======
+    active_routine = (
+        db.query(models.ClientRoutine)
+        .filter(models.ClientRoutine.client_id == user.id, models.ClientRoutine.active.is_(True))
+        .order_by(models.ClientRoutine.assigned_at.desc())
+        .first()
+    )
+
+    frequency = 1
+    if active_routine:
+        # Contamos días distintos del snapshot (robusto aunque base cambie)
+        frequency = (
+            db.query(models.ClientRoutineItem.day_index)
+            .filter(models.ClientRoutineItem.client_routine_id == active_routine.id)
+            .distinct()
+            .count()
+        ) or 1
+
+    # ====== RACHA CÍCLICA: 1..N..1..N ======
+    current_streak = 0
+    expected_day = 1
+
+    for log in logs:
+        di = int(log.day_index)
+        if di == expected_day:
+            current_streak += 1
+            expected_day = 1 if expected_day >= frequency else (expected_day + 1)
+        else:
+            # se corta: nueva racha arrancando en ese día
+            current_streak = 1
+            # el siguiente esperado es el próximo en el ciclo
+            expected_day = 1 if di >= frequency else (di + 1)
+
+    last_training_date = logs[-1].completed_at
+
+    # ====== PROMEDIO SEMANAL ======
+    first_date = logs[0].completed_at.date()
+    last_date = logs[-1].completed_at.date()
+    total_days = (last_date - first_date).days + 1
+    total_weeks = max(total_days / 7, 1)
+
+    average_per_week = round(total_trainings / total_weeks, 2)
+
+    return {
+        "total_trainings": total_trainings,
+        "trainings_this_week": trainings_this_week,
+        "current_streak": current_streak,
+        "last_training_date": last_training_date,
+        "average_per_week": average_per_week,
+        "cycle_frequency": int(frequency),
+    }
+
+class UpdateRoutineItemRequest(BaseModel):
+    sets: str | None = None
+    reps: str | None = None
+    weight_base_kg: float | None = None
+    rest_seconds: int | None = None
+    notes: str | None = None
+
+
+@router.patch("/client/{dni}/items/{item_id}")
+def update_routine_item(
+    dni: str,
+    item_id: str,
+    data: UpdateRoutineItemRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Edita un ítem del snapshot de rutina de un cliente.
+    Solo ENTRENADOR / COORDINADOR / ADMINISTRADOR.
+    El ítem debe pertenecer a la rutina activa del cliente.
+    """
+    _require_role(current_user, {"ENTRENADOR", "COORDINADOR", "ADMINISTRADOR"})
+
+    # Verificar que el cliente existe
+    client = db.query(models.User).filter(models.User.dni == dni).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+
+    # Verificar que tiene rutina activa
+    active_routine = (
+        db.query(models.ClientRoutine)
+        .filter(
+            models.ClientRoutine.client_id == client.id,
+            models.ClientRoutine.active.is_(True),
+        )
+        .first()
+    )
+    if not active_routine:
+        raise HTTPException(status_code=404, detail="El cliente no tiene rutina activa")
+
+    # Buscar el item verificando que pertenece a ESA rutina (seguridad)
+    try:
+        item_uuid = __import__("uuid").UUID(item_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="item_id inválido")
+
+    item = (
+        db.query(models.ClientRoutineItem)
+        .filter(
+            models.ClientRoutineItem.id == item_uuid,
+            models.ClientRoutineItem.client_routine_id == active_routine.id,
+        )
+        .first()
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Item no encontrado")
+
+    # Aplicar solo los campos enviados (PATCH semántico)
+    if data.sets is not None:
+        item.sets = data.sets
+    if data.reps is not None:
+        item.reps = data.reps
+    if data.weight_base_kg is not None:
+        item.weight_base_kg = data.weight_base_kg
+    if data.rest_seconds is not None:
+        item.rest_seconds = data.rest_seconds
+    if data.notes is not None:
+        item.notes = data.notes
+
+    db.commit()
+    db.refresh(item)
+
+    return {
+        "item_id": str(item.id),
+        "sets": item.sets,
+        "reps": item.reps,
+        "weight_base_kg": float(item.weight_base_kg) if item.weight_base_kg is not None else None,
+        "rest_seconds": item.rest_seconds,
+        "notes": item.notes,
+    }
+
+# =============================================================================
+# PATCH /routines/client/{dni}/items/{item_id}
+# =============================================================================
+
+class UpdateRoutineItemRequest(BaseModel):
+    sets: str | None = None
+    reps: str | None = None
+    weight_base_kg: float | None = None
+    rest_seconds: int | None = None
+    notes: str | None = None
+
+
+def _get_active_routine_for_client_id(
+    db: Session,
+    client_id,
+) -> models.ClientRoutine | None:
+    """Rutina activa del cliente. Centralizado para futura migración active -> status."""
+    return (
+        db.query(models.ClientRoutine)
+        .filter(
+            models.ClientRoutine.client_id == client_id,
+            models.ClientRoutine.active.is_(True),
+        )
+        .first()
+    )
+
+
+@router.patch("/client/{dni}/items/{item_id}")
+def update_routine_item(
+    dni: str,
+    item_id: str,
+    data: UpdateRoutineItemRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Edita un ítem del snapshot de rutina de un cliente.
+    Solo ENTRENADOR / COORDINADOR / ADMINISTRADOR.
+    Valida: cliente existe → rutina activa → item pertenece a esa rutina.
+    """
+    import uuid as _uuid
+
+    _require_role(current_user, {"ENTRENADOR", "COORDINADOR", "ADMINISTRADOR"})
+
+    client = db.query(models.User).filter(models.User.dni == dni).first()
+    if not client:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cliente no encontrado")
+
+    active_routine = _get_active_routine_for_client_id(db, client.id)
+    if not active_routine:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="El cliente no tiene rutina activa")
+
+    try:
+        item_uuid = _uuid.UUID(item_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="item_id inválido")
+
+    item = (
+        db.query(models.ClientRoutineItem)
+        .filter(
+            models.ClientRoutineItem.id == item_uuid,
+            models.ClientRoutineItem.client_routine_id == active_routine.id,
+        )
+        .first()
+    )
+    if not item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item no encontrado")
+
+    # PATCH semántico: solo actualiza los campos enviados
+    if data.sets is not None:
+        item.sets = data.sets
+    if data.reps is not None:
+        item.reps = data.reps
+    if data.weight_base_kg is not None:
+        item.weight_base_kg = data.weight_base_kg
+    if data.rest_seconds is not None:
+        item.rest_seconds = data.rest_seconds
+    if data.notes is not None:
+        item.notes = data.notes
+
+    db.commit()
+    db.refresh(item)
+
+    return {
+        "item_id": str(item.id),
+        "day_index": item.day_index,
+        "order_index": item.order_index,
+        "exercise_key": item.exercise_key,
+        "sets": item.sets,
+        "reps": item.reps,
+        "weight_base_kg": float(item.weight_base_kg) if item.weight_base_kg is not None else None,
+        "rest_seconds": item.rest_seconds,
+        "notes": item.notes,
+    }

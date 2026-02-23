@@ -1,8 +1,8 @@
 cd C:\rutinas_ds\backend
 .venv\Scripts\activate
-uvicorn app.main:app --reload --port 8001
+uvicorn app.main:app --reload --port 8000
 
-http://127.0.0.1:8001/docs
+http://127.0.0.1:8000/docs
 
 tree /F /A
 tree /F > tree.txt

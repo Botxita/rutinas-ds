@@ -220,3 +220,251 @@ def create_client(
         detail += f". Último error: {last_err}"
 
     raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail)
+@router.get("/clients", status_code=200)
+def list_clients(
+    search: str = None,
+    page: int = 1,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Lista de clientes con estado de rutina activa.
+    Solo ENTRENADOR / COORDINADOR / ADMINISTRADOR.
+    """
+    _require_role(current_user, {"ENTRENADOR", "COORDINADOR", "ADMINISTRADOR"})
+
+    q = db.query(models.User).filter(
+        models.User.role.in_(["CLIENTE", "CLIENT", "cliente", "client"])
+    )
+
+    if search:
+        term = search.strip()
+        q = q.filter(
+            models.User.dni.ilike(f"%{term}%") |
+            models.User.first_name.ilike(f"%{term}%") |
+            models.User.last_name.ilike(f"%{term}%")
+        )
+
+    total = q.count()
+    users = q.order_by(models.User.last_name.asc(), models.User.first_name.asc()) \
+             .offset((page - 1) * limit) \
+             .limit(limit) \
+             .all()
+
+    clients = []
+    for u in users:
+        # Buscar rutina activa
+        active_routine = (
+            db.query(models.ClientRoutine)
+            .filter(
+                models.ClientRoutine.client_id == u.id,
+                models.ClientRoutine.active.is_(True),
+            )
+            .join(models.BaseRoutine, models.ClientRoutine.base_routine_id == models.BaseRoutine.id)
+            .add_entity(models.BaseRoutine)
+            .first()
+        )
+
+        has_active = active_routine is not None
+        routine_name = None
+        if active_routine:
+            _, base = active_routine
+            routine_name = f"{base.sheet_routine_id} – {base.name}"
+
+        full_name = " ".join(
+            [x for x in [u.first_name, u.last_name] if x]
+        ).strip() or None
+
+        clients.append({
+            "id": str(u.id),
+            "dni": u.dni,
+            "full_name": full_name,
+            "is_active": bool(u.is_active),
+            "has_active_routine": has_active,
+            "routine_name": routine_name,
+        })
+
+    return {
+        "clients": clients,
+        "total": total,
+        "page": page,
+    }
+
+@router.get("/client/{dni}", status_code=200)
+def get_client_by_dni(
+    dni: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Perfil básico de un cliente por DNI.
+    Solo ENTRENADOR / COORDINADOR / ADMINISTRADOR.
+    """
+    _require_role(current_user, {"ENTRENADOR", "COORDINADOR", "ADMINISTRADOR"})
+
+    user = db.query(models.User).filter(models.User.dni == dni).first()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="Cliente no encontrado")
+
+    if _normalize_role(user.role) != "CLIENTE":
+        raise HTTPException(status_code=400, detail="El DNI no corresponde a un CLIENTE")
+
+    full_name = " ".join(
+        [x for x in [user.first_name, user.last_name] if x]
+    ).strip() or None
+
+    return {
+        "id": str(user.id),
+        "dni": user.dni,
+        "full_name": full_name,
+        "is_active": bool(user.is_active),
+    }
+
+ # =============================================================================
+# Helpers internos de rutinas (evita N+1 en lista de clientes)
+# =============================================================================
+
+def _get_active_routine_for_client_id(
+    db: Session,
+    client_id,
+) -> tuple[models.ClientRoutine, models.BaseRoutine] | None:
+    """Devuelve (ClientRoutine, BaseRoutine) activa del cliente, o None.
+
+    Centralizado aquí para facilitar futura migración de active -> status.
+    """
+    row = (
+        db.query(models.ClientRoutine, models.BaseRoutine)
+        .join(models.BaseRoutine, models.ClientRoutine.base_routine_id == models.BaseRoutine.id)
+        .filter(
+            models.ClientRoutine.client_id == client_id,
+            models.ClientRoutine.active.is_(True),
+        )
+        .first()
+    )
+    return row  # (ClientRoutine, BaseRoutine) o None
+
+
+def _full_name(user: models.User) -> str | None:
+    return " ".join(
+        [x for x in [user.first_name, user.last_name] if x]
+    ).strip() or None
+
+
+# =============================================================================
+# Roles de cliente válidos en DB (varios por compatibilidad histórica)
+# =============================================================================
+_CLIENT_ROLE_VALUES = ("CLIENTE", "CLIENT", "cliente", "client", "User", "user")
+
+
+# =============================================================================
+# GET /users/clients
+# =============================================================================
+
+@router.get("/clients", status_code=status.HTTP_200_OK)
+def list_clients(
+    search: str | None = None,
+    page: int = 1,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Lista paginada de clientes con estado de rutina activa.
+    Solo ENTRENADOR / COORDINADOR / ADMINISTRADOR.
+    Un único JOIN evita N+1 queries.
+    """
+    from sqlalchemy import or_, outerjoin
+    from sqlalchemy.orm import aliased
+
+    _require_role(current_user, {"ENTRENADOR", "COORDINADOR", "ADMINISTRADOR"})
+
+    # Base query: solo usuarios con role de cliente
+    q = db.query(models.User).filter(
+        models.User.role.in_(_CLIENT_ROLE_VALUES)
+    )
+
+    if search:
+        term = search.strip()
+        q = q.filter(
+            or_(
+                models.User.dni.ilike(f"%{term}%"),
+                models.User.first_name.ilike(f"%{term}%"),
+                models.User.last_name.ilike(f"%{term}%"),
+            )
+        )
+
+    total = q.count()
+
+    users = (
+        q.order_by(models.User.last_name.asc(), models.User.first_name.asc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+        .all()
+    )
+
+    if not users:
+        return {"clients": [], "total": total, "page": page, "limit": limit}
+
+    # Un solo query para todas las rutinas activas del batch
+    client_ids = [u.id for u in users]
+    active_routines: dict = {}  # client_id -> (ClientRoutine, BaseRoutine)
+
+    rows = (
+        db.query(models.ClientRoutine, models.BaseRoutine)
+        .join(models.BaseRoutine, models.ClientRoutine.base_routine_id == models.BaseRoutine.id)
+        .filter(
+            models.ClientRoutine.client_id.in_(client_ids),
+            models.ClientRoutine.active.is_(True),
+        )
+        .all()
+    )
+    for cr, br in rows:
+        active_routines[cr.client_id] = (cr, br)
+
+    clients = []
+    for u in users:
+        row = active_routines.get(u.id)
+        has_active = row is not None
+        routine_name = f"{row[1].sheet_routine_id} – {row[1].name}" if row else None
+
+        clients.append({
+            "id": str(u.id),
+            "dni": u.dni,
+            "full_name": _full_name(u),
+            "is_active": bool(u.is_active),
+            "has_active_routine": has_active,
+            "routine_name": routine_name,
+        })
+
+    return {"clients": clients, "total": total, "page": page, "limit": limit}
+
+
+# =============================================================================
+# GET /users/client/{dni}
+# =============================================================================
+
+@router.get("/client/{dni}", status_code=status.HTTP_200_OK)
+def get_client_by_dni(
+    dni: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Perfil básico de un cliente por DNI.
+    Solo ENTRENADOR / COORDINADOR / ADMINISTRADOR.
+    """
+    _require_role(current_user, {"ENTRENADOR", "COORDINADOR", "ADMINISTRADOR"})
+
+    user = db.query(models.User).filter(models.User.dni == dni).first()
+
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cliente no encontrado")
+
+    if _normalize_role(user.role) != "CLIENTE":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cliente no encontrado")
+
+    return {
+        "id": str(user.id),
+        "dni": user.dni,
+        "full_name": _full_name(user),
+        "is_active": bool(user.is_active),
+    }   

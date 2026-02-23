@@ -1,0 +1,149 @@
+function syncRutinaBaseToSupabase() {
+  const SUPABASE_URL = 'https://rjqvnybxqcpmwsdbzyxy.supabase.co';
+  const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJqcXZueWJ4cWNwbXdzZGJ6eXh5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk3NzkyNjIsImV4cCI6MjA4NTM1NTI2Mn0.I4Fb6FVuU94YLLARObzmHAff6hPxVyDDDXEPku2XnX8';
+
+  const SHEET_NAME = 'RUTINAS_BASE'; // <-- AJUSTAR al nombre real de la pestaña
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) throw new Error(`No existe la pestaña: ${SHEET_NAME}`);
+
+  const rows = sheet.getDataRange().getValues();
+  const headers = rows[0];
+  const dataRows = rows.slice(1);
+
+  const idx = name => {
+    const i = headers.indexOf(name);
+    if (i === -1) throw new Error(`No existe la columna: "${name}"`);
+    return i;
+  };
+
+  // ---- 1) Armar dataset desde Sheet
+  const parsed = dataRows
+    .filter(r => r[idx('ID Rutina')]) // RB001
+    .map(r => ({
+      sheet_routine_id: String(r[idx('ID Rutina')]).trim(),          // RB001
+      routine_name: String(r[idx('Nombre Rutina')]).trim(),          // nombre
+      day_index: Number(r[idx('Día / Entrenamiento')]),
+      order_index: Number(r[idx('Orden')]),
+      category: r[idx('Categoría')] ? String(r[idx('Categoría')]).trim() : null,
+      exercise_key: r[idx('Ejercicio')] ? String(r[idx('Ejercicio')]).trim() : null,
+      notes: r[idx('Observaciones')] ? String(r[idx('Observaciones')]).trim() : null,
+      sets: r[idx('Series')] !== '' ? Number(r[idx('Series')]) : null,
+      reps: r[idx('Reps')] ? String(r[idx('Reps')]).trim() : null,
+      rest_seconds: r[idx('Descanso_seg')] !== '' ? Number(r[idx('Descanso_seg')]) : null,
+      weight_base_kg: r[idx('Peso_base_kg')] !== '' ? Number(r[idx('Peso_base_kg')]) : null
+    }));
+
+  // ---- 2) Upsert de base_routines (cabeceras) por sheet_routine_id
+  // Creamos/actualizamos name y active=true; version=1 si no existía.
+  const uniqueRoutines = {};
+  parsed.forEach(x => {
+    uniqueRoutines[x.sheet_routine_id] = x.routine_name;
+  });
+
+  const routinesPayload = Object.entries(uniqueRoutines).map(([sheet_routine_id, name]) => ({
+    sheet_routine_id,
+    name,
+    version: 1,
+    active: true,
+    updated_at: new Date().toISOString()
+  }));
+
+  upsertSupabase(
+    SUPABASE_URL,
+    SUPABASE_KEY,
+    'base_routines',
+    routinesPayload,
+    'sheet_routine_id'
+  );
+
+  // ---- 3) Traer mapping RBxxx -> UUID desde Supabase
+  const sheetIds = Object.keys(uniqueRoutines);
+  const mapping = fetchBaseRoutineIdMapping(SUPABASE_URL, SUPABASE_KEY, sheetIds);
+  // mapping: { "RB001": "uuid", ... }
+
+  // ---- 4) Preparar payload de items con base_routine_id UUID real
+  const itemsPayload = parsed.map(x => {
+    const uuid = mapping[x.sheet_routine_id];
+    if (!uuid) throw new Error(`No pude resolver UUID para ID Rutina "${x.sheet_routine_id}"`);
+    return {
+      base_routine_id: uuid,
+      day_index: x.day_index,
+      order_index: x.order_index,
+      category: x.category,
+      exercise_key: x.exercise_key,
+      sets: x.sets,
+      reps: x.reps,
+      rest_seconds: x.rest_seconds,
+      weight_base_kg: x.weight_base_kg,
+      notes: x.notes
+    };
+  });
+
+  // ---- 5) Upsert de items por slot único
+  upsertSupabase(
+    SUPABASE_URL,
+    SUPABASE_KEY,
+    'base_routine_items',
+    itemsPayload,
+    'base_routine_id,day_index,order_index'
+  );
+
+  Logger.log(`OK: Rutinas sincronizadas: ${sheetIds.join(', ')}`);
+}
+
+
+// ---------------- HELPERS ----------------
+
+function upsertSupabase(SUPABASE_URL, SUPABASE_KEY, table, payloadArray, onConflict) {
+  const url = `${SUPABASE_URL}/rest/v1/${table}?on_conflict=${encodeURIComponent(onConflict)}`;
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${SUPABASE_KEY}`,
+      Prefer: 'resolution=merge-duplicates'
+    },
+    payload: JSON.stringify(payloadArray),
+    muteHttpExceptions: true
+  };
+
+  const res = UrlFetchApp.fetch(url, options);
+  const status = res.getResponseCode();
+  const body = res.getContentText();
+
+  Logger.log(`${table} upsert status: ${status}`);
+  if (status >= 400) {
+    throw new Error(`${table} upsert error: ${body}`);
+  }
+}
+
+function fetchBaseRoutineIdMapping(SUPABASE_URL, SUPABASE_KEY, sheetRoutineIds) {
+  // Supabase REST: filter OR: sheet_routine_id.in.(RB001,RB002)
+  const inList = sheetRoutineIds.map(x => `"${x}"`).join(',');
+  const url = `${SUPABASE_URL}/rest/v1/base_routines?select=id,sheet_routine_id&sheet_routine_id=in.(${encodeURIComponent(inList)})`;
+
+  const options = {
+    method: 'get',
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${SUPABASE_KEY}`
+    },
+    muteHttpExceptions: true
+  };
+
+  const res = UrlFetchApp.fetch(url, options);
+  const status = res.getResponseCode();
+  const body = res.getContentText();
+
+  if (status >= 400) {
+    throw new Error(`base_routines fetch error: ${body}`);
+  }
+
+  const rows = JSON.parse(body);
+  const map = {};
+  rows.forEach(r => {
+    map[r.sheet_routine_id] = r.id;
+  });
+  return map;
+}
