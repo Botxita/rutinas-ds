@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid as _uuid
 from datetime import date
 from typing import Any
 
@@ -64,6 +65,21 @@ def _week_start(d: date) -> date:
     return d.fromordinal(d.toordinal() - d.weekday())
 
 
+def _get_active_routine_for_client_id(
+    db: Session,
+    client_id,
+) -> models.ClientRoutine | None:
+    """Rutina activa del cliente. Centralizado para futura migración active -> status."""
+    return (
+        db.query(models.ClientRoutine)
+        .filter(
+            models.ClientRoutine.client_id == client_id,
+            models.ClientRoutine.active.is_(True),
+        )
+        .first()
+    )
+
+
 # =============================================================================
 # Schemas
 # =============================================================================
@@ -101,6 +117,7 @@ class BaseRoutineResponse(BaseModel):
 
 
 class ClientRoutineItemResponse(BaseModel):
+    id: str                  # UUID del item en client_routine_items
     day_index: int
     order_index: int
     category: str | None
@@ -118,6 +135,14 @@ class ClientRoutineResponse(BaseModel):
     name: str
     version: int
     items: list[ClientRoutineItemResponse]
+
+
+class UpdateRoutineItemRequest(BaseModel):
+    sets: str | None = None
+    reps: str | None = None
+    weight_base_kg: float | None = None
+    rest_seconds: int | None = None
+    notes: str | None = None
 
 
 # =============================================================================
@@ -196,12 +221,7 @@ def get_active_routine_for_client_staff(
     if not client:
         raise HTTPException(status_code=404, detail="Cliente no encontrado")
 
-    cr = (
-        db.query(models.ClientRoutine)
-        .filter(models.ClientRoutine.client_id == client.id, models.ClientRoutine.active.is_(True))
-        .order_by(models.ClientRoutine.assigned_at.desc())
-        .first()
-    )
+    cr = _get_active_routine_for_client_id(db, client.id)
     if not cr:
         raise HTTPException(status_code=404, detail="El cliente no tiene rutina activa")
 
@@ -221,6 +241,7 @@ def get_active_routine_for_client_staff(
         version=int(base.version) if base else 0,
         items=[
             ClientRoutineItemResponse(
+                id=str(i.id),
                 day_index=i.day_index,
                 order_index=i.order_index,
                 category=i.category,
@@ -244,12 +265,7 @@ def get_my_active_routine(
     if _normalize_role(current_user.role) != "CLIENTE":
         raise HTTPException(status_code=403, detail="Solo disponible para CLIENTE")
 
-    cr = (
-        db.query(models.ClientRoutine)
-        .filter(models.ClientRoutine.client_id == current_user.id, models.ClientRoutine.active.is_(True))
-        .order_by(models.ClientRoutine.assigned_at.desc())
-        .first()
-    )
+    cr = _get_active_routine_for_client_id(db, current_user.id)
     if not cr:
         raise HTTPException(status_code=404, detail="No tenés rutina activa")
 
@@ -269,6 +285,7 @@ def get_my_active_routine(
         version=int(base.version) if base else 0,
         items=[
             ClientRoutineItemResponse(
+                id=str(i.id),
                 day_index=i.day_index,
                 order_index=i.order_index,
                 category=i.category,
@@ -302,14 +319,7 @@ def complete_training(
 
     try:
         # Rutina activa
-        client_routine = (
-            db.query(models.ClientRoutine)
-            .filter(
-                models.ClientRoutine.client_id == client.id,
-                models.ClientRoutine.active.is_(True),
-            )
-            .first()
-        )
+        client_routine = _get_active_routine_for_client_id(db, client.id)
         if not client_routine:
             raise HTTPException(status_code=404, detail="No tiene rutina activa")
 
@@ -347,7 +357,7 @@ def complete_training(
             client_id=client.id,
             client_routine_id=client_routine.id,
             day_index=day_to_complete,
-            completed_date=today,  # 👈 obligatorio ahora
+            completed_date=today,
             recorded_by=current_user.id,
         )
         db.add(log)
@@ -368,7 +378,7 @@ def complete_training(
         plan_state.bases_done_this_week = int(plan_state.bases_done_this_week or 0) + 1
         plan_state.updated_at = func.now()
 
-        db.flush()   # importante para que el lock se mantenga consistente
+        db.flush()
         db.commit()
 
     except HTTPException:
@@ -463,16 +473,10 @@ def get_training_metrics(
         }
 
     # ====== FRECUENCIA (N días del ciclo) desde la rutina activa ======
-    active_routine = (
-        db.query(models.ClientRoutine)
-        .filter(models.ClientRoutine.client_id == user.id, models.ClientRoutine.active.is_(True))
-        .order_by(models.ClientRoutine.assigned_at.desc())
-        .first()
-    )
+    active_routine = _get_active_routine_for_client_id(db, user.id)
 
     frequency = 1
     if active_routine:
-        # Contamos días distintos del snapshot (robusto aunque base cambie)
         frequency = (
             db.query(models.ClientRoutineItem.day_index)
             .filter(models.ClientRoutineItem.client_routine_id == active_routine.id)
@@ -490,9 +494,7 @@ def get_training_metrics(
             current_streak += 1
             expected_day = 1 if expected_day >= frequency else (expected_day + 1)
         else:
-            # se corta: nueva racha arrancando en ese día
             current_streak = 1
-            # el siguiente esperado es el próximo en el ciclo
             expected_day = 1 if di >= frequency else (di + 1)
 
     last_training_date = logs[-1].completed_at
@@ -514,112 +516,6 @@ def get_training_metrics(
         "cycle_frequency": int(frequency),
     }
 
-class UpdateRoutineItemRequest(BaseModel):
-    sets: str | None = None
-    reps: str | None = None
-    weight_base_kg: float | None = None
-    rest_seconds: int | None = None
-    notes: str | None = None
-
-
-@router.patch("/client/{dni}/items/{item_id}")
-def update_routine_item(
-    dni: str,
-    item_id: str,
-    data: UpdateRoutineItemRequest,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    """Edita un ítem del snapshot de rutina de un cliente.
-    Solo ENTRENADOR / COORDINADOR / ADMINISTRADOR.
-    El ítem debe pertenecer a la rutina activa del cliente.
-    """
-    _require_role(current_user, {"ENTRENADOR", "COORDINADOR", "ADMINISTRADOR"})
-
-    # Verificar que el cliente existe
-    client = db.query(models.User).filter(models.User.dni == dni).first()
-    if not client:
-        raise HTTPException(status_code=404, detail="Cliente no encontrado")
-
-    # Verificar que tiene rutina activa
-    active_routine = (
-        db.query(models.ClientRoutine)
-        .filter(
-            models.ClientRoutine.client_id == client.id,
-            models.ClientRoutine.active.is_(True),
-        )
-        .first()
-    )
-    if not active_routine:
-        raise HTTPException(status_code=404, detail="El cliente no tiene rutina activa")
-
-    # Buscar el item verificando que pertenece a ESA rutina (seguridad)
-    try:
-        item_uuid = __import__("uuid").UUID(item_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="item_id inválido")
-
-    item = (
-        db.query(models.ClientRoutineItem)
-        .filter(
-            models.ClientRoutineItem.id == item_uuid,
-            models.ClientRoutineItem.client_routine_id == active_routine.id,
-        )
-        .first()
-    )
-    if not item:
-        raise HTTPException(status_code=404, detail="Item no encontrado")
-
-    # Aplicar solo los campos enviados (PATCH semántico)
-    if data.sets is not None:
-        item.sets = data.sets
-    if data.reps is not None:
-        item.reps = data.reps
-    if data.weight_base_kg is not None:
-        item.weight_base_kg = data.weight_base_kg
-    if data.rest_seconds is not None:
-        item.rest_seconds = data.rest_seconds
-    if data.notes is not None:
-        item.notes = data.notes
-
-    db.commit()
-    db.refresh(item)
-
-    return {
-        "item_id": str(item.id),
-        "sets": item.sets,
-        "reps": item.reps,
-        "weight_base_kg": float(item.weight_base_kg) if item.weight_base_kg is not None else None,
-        "rest_seconds": item.rest_seconds,
-        "notes": item.notes,
-    }
-
-# =============================================================================
-# PATCH /routines/client/{dni}/items/{item_id}
-# =============================================================================
-
-class UpdateRoutineItemRequest(BaseModel):
-    sets: str | None = None
-    reps: str | None = None
-    weight_base_kg: float | None = None
-    rest_seconds: int | None = None
-    notes: str | None = None
-
-
-def _get_active_routine_for_client_id(
-    db: Session,
-    client_id,
-) -> models.ClientRoutine | None:
-    """Rutina activa del cliente. Centralizado para futura migración active -> status."""
-    return (
-        db.query(models.ClientRoutine)
-        .filter(
-            models.ClientRoutine.client_id == client_id,
-            models.ClientRoutine.active.is_(True),
-        )
-        .first()
-    )
-
 
 @router.patch("/client/{dni}/items/{item_id}")
 def update_routine_item(
@@ -633,8 +529,6 @@ def update_routine_item(
     Solo ENTRENADOR / COORDINADOR / ADMINISTRADOR.
     Valida: cliente existe → rutina activa → item pertenece a esa rutina.
     """
-    import uuid as _uuid
-
     _require_role(current_user, {"ENTRENADOR", "COORDINADOR", "ADMINISTRADOR"})
 
     client = db.query(models.User).filter(models.User.dni == dni).first()
@@ -686,4 +580,56 @@ def update_routine_item(
         "weight_base_kg": float(item.weight_base_kg) if item.weight_base_kg is not None else None,
         "rest_seconds": item.rest_seconds,
         "notes": item.notes,
+    }
+
+
+# =============================================================================
+# GET /routines/state/{dni}  — día actual + total días del ciclo
+# =============================================================================
+
+@router.get("/state/{dni}")
+def get_client_state(
+    dni: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Devuelve el estado de avance del cliente:
+    - next_day: día que le toca ahora (next_base_day_index)
+    - total_days: total de días distintos en su rutina activa
+    - bases_done_this_week: cuántos completó esta semana
+    Solo CLIENTE (propio) o STAFF.
+    """
+    _require_self_or_staff(current_user, dni)
+
+    client = db.query(models.User).filter(models.User.dni == dni).first()
+    if not client:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cliente no encontrado")
+
+    # Estado de avance
+    plan_state = (
+        db.query(models.ClientPlanState)
+        .filter(models.ClientPlanState.client_id == client.id)
+        .first()
+    )
+    next_day = int(plan_state.next_base_day_index) if plan_state else 1
+    bases_done_this_week = int(plan_state.bases_done_this_week) if plan_state else 0
+
+    # Total días del ciclo desde la rutina activa
+    active_routine = _get_active_routine_for_client_id(db, client.id)
+    if not active_routine:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="El cliente no tiene rutina activa",
+        )
+
+    total_days = (
+        db.query(func.count(models.ClientRoutineItem.day_index.distinct()))
+        .filter(models.ClientRoutineItem.client_routine_id == active_routine.id)
+        .scalar()
+    ) or 1
+
+    return {
+        "next_day": next_day,
+        "total_days": int(total_days),
+        "bases_done_this_week": bases_done_this_week,
     }
